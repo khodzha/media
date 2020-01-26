@@ -27,3 +27,6 @@ version = "0.2"
 
 [dependencies.num-traits]
 version = "0.2"
+
+[dependencies.lazy_static]
+version = "1.2.0"

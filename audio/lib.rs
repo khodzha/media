@@ -16,6 +16,9 @@ extern crate smallvec;
 pub mod macros;
 extern crate servo_media_traits;
 
+#[macro_use]
+extern crate lazy_static;
+
 pub mod analyser_node;
 pub mod biquad_filter_node;
 pub mod block;

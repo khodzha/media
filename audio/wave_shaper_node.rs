@@ -1,12 +1,5 @@
-use block::Chunk;
+use block::{Block, Chunk, OverSampleType};
 use node::{AudioNodeEngine, AudioNodeType, BlockInfo, ChannelInfo};
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum OverSampleType {
-    None,
-    Double,
-    Quadruple,
-}
 
 type WaveShaperCurve = Option<Vec<f32>>;
 
@@ -49,8 +42,8 @@ impl WaveShaperNode {
                 "WaveShaperNode curve must have length of 2 or more"
             )
         }
-        if options.oversample != OverSampleType::None {
-            unimplemented!("No oversampling for WaveShaperNode yet");
+        if options.oversample == OverSampleType::Quadruple {
+            unimplemented!("No 4x oversampling for WaveShaperNode yet");
         }
 
         Self {
@@ -82,32 +75,16 @@ impl AudioNodeEngine for WaveShaperNode {
     fn process(&mut self, mut inputs: Chunk, _info: &BlockInfo) -> Chunk {
         debug_assert!(inputs.len() == 1);
 
-        if inputs.blocks[0].is_silence() {
-            return inputs;
-        }
+        if self.curve.is_some() {
+            let mut blocks = Block::upsample(&inputs.blocks[0], self.oversample);
 
-        if let Some(curve) = &self.curve {
-            let mut iter = inputs.blocks[0].iter();
+            blocks.iter_mut().for_each(|b| {
+                self.apply_curve(b);
+            });
 
-            while let Some(mut frame) = iter.next() {
-                frame.mutate_with(|sample, _| {
-                    let len = curve.len();
-                    let curve_index: f32 = ((len - 1) as f32) * (*sample + 1.) / 2.;
+            let block = Block::downsample(blocks, self.oversample);
 
-                    if curve_index <= 0. {
-                        *sample = curve[0];
-                    } else if curve_index >= len as f32 {
-                        *sample = curve[len - 1];
-                    } else {
-                        let index_lo = curve_index as usize;
-                        let index_hi = index_lo + 1;
-                        let interp_factor: f32 = curve_index - index_lo as f32;
-                        *sample = (1. - interp_factor) * curve[index_lo]
-                            + interp_factor * curve[index_hi];
-                    }
-                });
-            }
-
+            inputs.blocks[0] = block;
             inputs
         } else {
             inputs
@@ -115,4 +92,31 @@ impl AudioNodeEngine for WaveShaperNode {
     }
 
     make_message_handler!(WaveShaperNode: handle_waveshaper_message);
+}
+
+impl WaveShaperNode {
+    fn apply_curve(&mut self, block: &mut Block) {
+        let curve = &self.curve.as_ref().unwrap();
+
+        let mut iter = block.iter();
+
+        while let Some(mut frame) = iter.next() {
+            frame.mutate_with(|sample, _| {
+                let len = curve.len();
+                let curve_index: f32 = ((len - 1) as f32) * (*sample + 1.) / 2.;
+
+                if curve_index <= 0. {
+                    *sample = curve[0];
+                } else if curve_index >= (len - 1) as f32 {
+                    *sample = curve[len - 1];
+                } else {
+                    let index_lo = curve_index as usize;
+                    let index_hi = index_lo + 1;
+                    let interp_factor: f32 = curve_index - index_lo as f32;
+                    *sample =
+                        (1. - interp_factor) * curve[index_lo] + interp_factor * curve[index_hi];
+                }
+            });
+        }
+    }
 }

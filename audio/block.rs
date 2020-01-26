@@ -147,6 +147,78 @@ impl Block {
         &mut self.buffer
     }
 
+    pub fn upsample(block: &Block, oversample: OverSampleType) -> Vec<Block> {
+        if !block.is_silence() && oversample != OverSampleType::None {
+            let upsampled_blocks_num = oversample.to_num();
+
+            let mut upsampled_blocks: Vec<Block> = vec![
+                Block {
+                    channels: block.channels,
+                    repeat: block.repeat,
+                    buffer: vec![0.; FRAMES_PER_BLOCK_USIZE * (block.channels as usize)]
+                };
+                upsampled_blocks_num
+            ];
+
+            for chan in 0..block.channels {
+                let buf = block.data_chan(chan);
+
+                for i in 0..FRAMES_PER_BLOCK_USIZE * 2 {
+                    let ibuf_idx = i / 2;
+                    let obuf_idx = i % FRAMES_PER_BLOCK_USIZE;
+                    let upsampled_buffer_p = &mut upsampled_blocks[i / FRAMES_PER_BLOCK_USIZE]
+                        .data_chan_mut(chan)[obuf_idx];
+
+                    if i % 2 == 0 {
+                        *upsampled_buffer_p = buf[ibuf_idx];
+                    } else {
+                        for j in 0..=ibuf_idx {
+                            let sinc_idx: f32 = (j as f32) - ibuf_idx as f32 - 0.5;
+                            *upsampled_buffer_p += SINC_TABLE.weighted_value(buf[j], sinc_idx);
+                        }
+
+                        for j in (ibuf_idx + 1)..buf.len() {
+                            let sinc_idx: f32 = (j as f32) - ibuf_idx as f32 - 0.5;
+                            *upsampled_buffer_p += SINC_TABLE.weighted_value(buf[j], sinc_idx);
+                        }
+                    }
+                }
+            }
+
+            upsampled_blocks
+        } else {
+            vec![block.clone()]
+        }
+    }
+
+    pub fn downsample(mut blocks: Vec<Block>, oversample: OverSampleType) -> Block {
+        if oversample == OverSampleType::None {
+            blocks.remove(1)
+        } else {
+            let mut b = blocks[0].clone();
+
+            let upsampled_blocks_num = oversample.to_num();
+
+            for chan in 0..b.channels {
+                for block_idx in 0..upsampled_blocks_num {
+                    let block_offset = FRAMES_PER_BLOCK_USIZE / upsampled_blocks_num * block_idx;
+                    let next_block_offset =
+                        FRAMES_PER_BLOCK_USIZE / upsampled_blocks_num * (block_idx + 1);
+                    let buf = b.data_chan_mut(chan);
+
+                    for i in block_offset..next_block_offset {
+                        let buf_p = &mut buf[i];
+                        let new_val = SINC_TABLE
+                            .weighted_value(blocks[block_idx].buffer[(i - block_offset) * 2], 0.);
+                        *buf_p = new_val;
+                    }
+                }
+            }
+
+            b
+        }
+    }
+
     pub fn explicit_repeat(&mut self) {
         if self.repeat {
             debug_assert!(self.buffer.len() == FRAMES_PER_BLOCK_USIZE);
@@ -645,4 +717,112 @@ impl Tick {
     pub fn advance(&mut self) {
         self.0 += 1;
     }
+}
+
+pub struct SincTable {
+    pub zero_crossings: i32,
+    pub samples_per_crossing: i32,
+    pub table: Vec<f32>,
+}
+
+impl SincTable {
+    pub fn weighted_value(&self, val: f32, idx: f32) -> f32 {
+        let idx = idx.abs() * (self.samples_per_crossing as f32);
+
+        if idx > self.table.len() as f32 {
+            0.
+        } else {
+            let interp_factor = idx.fract();
+            let lo_idx = idx.floor() as usize;
+            let hi_idx = idx.ceil() as usize;
+
+            val * ((1. - interp_factor) * self.table[lo_idx] + interp_factor * self.table[hi_idx])
+        }
+    }
+
+    fn sinc(x: f32) -> f32 {
+        if x == 0. {
+            1.
+        } else {
+            let x = std::f32::consts::PI * x;
+            (x.sin() / x)
+        }
+    }
+
+    fn kaiser(n: i32, len: i32) -> f32 {
+        let beta = 0.1102 * (90. - 8.7);
+        if n < -len || n > len {
+            return 0.0;
+        }
+
+        let tau = n as f32 / len as f32;
+        let arg = beta * (1.0 - tau * tau).sqrt();
+
+        SincTable::i_bessel(arg) / SincTable::i_bessel(beta)
+    }
+
+    fn i_bessel(x: f32) -> f32 {
+        let half_x = 0.5 * x;
+
+        let mut n = 1;
+        let (mut sum, mut a) = (1.0, 1.0);
+
+        while a >= 1e-21 * sum {
+            let t = half_x / n as f32;
+
+            a *= t;
+            sum += a * a;
+
+            n += 1;
+        }
+
+        sum
+    }
+}
+
+impl Default for SincTable {
+    fn default() -> Self {
+        let zero_crossings = 20 as i32;
+        let samples_per_crossing = 200 as i32;
+
+        let table: Vec<f32> = (0..(zero_crossings * samples_per_crossing))
+            .map(|i| {
+                let ii = i as f32;
+                let crossings = samples_per_crossing as f32;
+                if i != 0 && i % samples_per_crossing == 0 {
+                    0.
+                } else {
+                    SincTable::sinc(ii / crossings)
+                        * SincTable::kaiser(i, zero_crossings * samples_per_crossing)
+                }
+            })
+            .collect();
+
+        Self {
+            zero_crossings: zero_crossings,
+            samples_per_crossing: samples_per_crossing,
+            table: table,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Copy)]
+pub enum OverSampleType {
+    None,
+    Double,
+    Quadruple,
+}
+
+impl OverSampleType {
+    pub fn to_num(&self) -> usize {
+        match self {
+            OverSampleType::Double => 2,
+            OverSampleType::Quadruple => unimplemented!("No 4x oversampling yet"),
+            OverSampleType::None => unreachable!(),
+        }
+    }
+}
+
+lazy_static! {
+    pub static ref SINC_TABLE: SincTable = SincTable::default();
 }
